@@ -49,8 +49,17 @@ case "$ARCH" in
 esac
 
 # ---------------------------------------------------------------------------
-# 3. Check required capabilities
+# 3. Ensure required tools exist (install them ourselves if missing)
 # ---------------------------------------------------------------------------
+for tool in curl tar; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "==> Installing missing tool: $tool"
+        DEBIAN_FRONTEND=noninteractive pkg install -y "$tool" || {
+            echo "ERROR: failed to install $tool" >&2
+            exit 1
+        }
+    fi
+done
 for tool in bash uname sed sha256sum mkdir install cp chmod rm dd od tr head grep; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "ERROR: required tool missing: $tool" >&2
@@ -59,12 +68,27 @@ for tool in bash uname sed sha256sum mkdir install cp chmod rm dd od tr head gre
 done
 
 # ---------------------------------------------------------------------------
+# 3b. Remove any previous/conflicting cline installations
+#     (our own past install, or leftovers from other install methods)
+# ---------------------------------------------------------------------------
+if [ -e "$PREFIX/bin/cline" ]; then
+    echo "==> Removing previous cline launcher ($PREFIX/bin/cline)"
+    rm -f "$PREFIX/bin/cline"
+fi
+if [ -d "$PREFIX/lib/cline" ]; then
+    echo "==> Removing previous cline runtime ($PREFIX/lib/cline)"
+    rm -rf "$PREFIX/lib/cline"
+fi
+
+# ---------------------------------------------------------------------------
 # 4. Install runtime dependencies if required (glibc loader + libraries)
 # ---------------------------------------------------------------------------
 GLIBC_LD="$PREFIX/glibc/lib/ld-linux-aarch64.so.1"
 GLIBC_LIBC="$PREFIX/glibc/lib/libc.so.6"
 
 if [ ! -x "$GLIBC_LD" ]; then
+    echo "==> Refreshing package index..."
+    DEBIAN_FRONTEND=noninteractive pkg update -y >/dev/null 2>&1 || true
     echo "==> Installing glibc runtime (glibc-repo, glibc-runner) ..."
     DEBIAN_FRONTEND=noninteractive pkg install -y glibc-repo || {
         echo "ERROR: failed to install glibc-repo (check network / Termux repos)" >&2
