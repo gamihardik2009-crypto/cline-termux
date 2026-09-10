@@ -1,0 +1,460 @@
+/* Directory redirection and execve shim for Bun on Termux */
+
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <link.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <time.h>
+#include <sys/mman.h>
+#include <errno.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+#define PREFIX_DEFAULT "/data/data/com.termux/files/usr"
+#define SHEBANG_MAX 256
+
+static const char *SAFE_DIR = NULL;
+static int safe_dir_fd = -1;
+static const char *PREFIX = NULL;
+static const char *TMPDIR = NULL;
+static const char *WRAPPER_PATH = NULL;
+static const char *TARGET_PATH = NULL;
+static char orig_cwd[PATH_MAX] = {0};
+
+static int is_ancestor(const char *pathname) {
+    if (!orig_cwd[0] || !pathname || !*pathname) return 0;
+    size_t plen = strlen(pathname);
+    /* Bun opens CWD ancestors with trailing slashes (e.g. "/data/"). Strip them
+     * so the prefix match against orig_cwd (no trailing slash) below works.
+     *
+     * See: bun-bun-v1.3.13/src/resolver/resolver.zig (dirInfoCachedMaybeLog)
+     */
+    while (plen > 1 && pathname[plen-1] == '/') plen--;
+    if (strncmp(orig_cwd, pathname, plen) != 0) return 0;
+    return (plen == 1) || (orig_cwd[plen] == '/');
+}
+
+static int (*real_openat)(int, const char *, int, ...) = NULL;
+static int (*real_openat64)(int, const char *, int, ...) = NULL;
+static FILE *(*real_fopen)(const char *, const char *) = NULL;
+static FILE *(*real_fopen64)(const char *, const char *) = NULL;
+static int (*real_execve)(const char *, char *const[], char *const[]) = NULL;
+static int (*real_mkdir)(const char *, mode_t) = NULL;
+static int (*real_symlink)(const char *, const char *) = NULL;
+
+static inline const char *getenv_nonempty(const char *name) {
+    const char *val = getenv(name);
+    return (val && *val) ? val : NULL;
+}
+
+/* Translate paths to use $PREFIX */
+static const char *translate_path(const char *path, char *buf, size_t bufsize) {
+    static const char *prefixes[] = {
+        "/usr/bin/", "/bin/", "/usr/sbin/", "/sbin/",
+    };
+    if (!path) return path;
+    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+        int skip = strlen(prefixes[i]);
+        if (strncmp(path, prefixes[i], skip) == 0) {
+            int n = snprintf(buf, bufsize, "%s/bin/%s", PREFIX, path + skip);
+            if (n < 0 || (size_t)n >= bufsize) return path;
+            return buf;
+        }
+    }
+    return path;
+}
+
+/* Translate /tmp paths to use $TMPDIR instead.
+ * path + 4 skips "/tmp" prefix to append remainder (e.g., "/tmp/foo" -> TMPDIR + "/foo").
+ */
+static const char *translate_tmp(const char *path, char *buf, size_t len) {
+    if (!path || !TMPDIR) return path;
+    if (strcmp(path, "/tmp") == 0 || strncmp(path, "/tmp/", 5) == 0) {
+        int n = snprintf(buf, len, "%s%s", TMPDIR, path + 4);
+        if (n < 0 || (size_t)n >= len) return path;
+        return buf;
+    }
+    return path;
+}
+
+static const char *translate_etc(const char *path, char *buf, size_t bufsize) {
+    if (!path || !PREFIX) return path;
+    if (strcmp(path, "/etc/resolv.conf") == 0 ||
+        strcmp(path, "/etc/nsswitch.conf") == 0 ||
+        strcmp(path, "/etc/hosts") == 0) {
+        int n = snprintf(buf, bufsize, "%s%s", PREFIX, path);
+        if (n < 0 || (size_t)n >= bufsize) return path;
+        return buf;
+    }
+    return path;
+}
+
+static void patch_bun_compiled(void);
+
+__attribute__((constructor))
+static void init_shim(void) {
+    const char *orig;
+
+    real_openat = dlsym(RTLD_NEXT, "openat");
+    real_openat64 = dlsym(RTLD_NEXT, "openat64");
+    real_fopen = dlsym(RTLD_NEXT, "fopen");
+    real_fopen64 = dlsym(RTLD_NEXT, "fopen64");
+    real_execve = dlsym(RTLD_NEXT, "execve");
+    real_mkdir = dlsym(RTLD_NEXT, "mkdir");
+    real_symlink = dlsym(RTLD_NEXT, "symlink");
+
+    if (!real_openat || !real_openat64 || !real_fopen || !real_fopen64 ||
+        !real_execve || !real_mkdir || !real_symlink) {
+        const char msg[] = "bun-shim: failed to resolve symbols\n";
+        syscall(SYS_write, STDERR_FILENO, msg, sizeof(msg) - 1);
+        _exit(1);
+    }
+
+    PREFIX = getenv_nonempty("PREFIX");
+    if (!PREFIX) PREFIX = PREFIX_DEFAULT;
+
+    TMPDIR = getenv_nonempty("TMPDIR");
+    if (!TMPDIR) TMPDIR = "/data/data/com.termux/files/usr/tmp";
+
+    WRAPPER_PATH = getenv_nonempty("BUN_TERMUX_WRAPPER");
+    TARGET_PATH = getenv_nonempty("BUN_TERMUX_TARGET");
+
+    SAFE_DIR = getenv_nonempty("BUN_FAKE_ROOT");
+    if (!SAFE_DIR) SAFE_DIR = TMPDIR;
+    safe_dir_fd = real_openat(AT_FDCWD, SAFE_DIR,
+                              O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+
+    /* Cache CWD for ancestor checks in directory redirection */
+    if (!getcwd(orig_cwd, sizeof(orig_cwd)))
+        orig_cwd[0] = '\0';
+
+    /* Restore original LD_* variables that were filtered during userland exec */
+    if ((orig = getenv("BUN_TERMUX_ORIG_LD_PRELOAD"))) {
+        setenv("LD_PRELOAD", orig, 1);
+        unsetenv("BUN_TERMUX_ORIG_LD_PRELOAD");
+    }
+    if ((orig = getenv("BUN_TERMUX_ORIG_LD_LIBRARY_PATH"))) {
+        setenv("LD_LIBRARY_PATH", orig, 1);
+        unsetenv("BUN_TERMUX_ORIG_LD_LIBRARY_PATH");
+    }
+
+    patch_bun_compiled();
+}
+
+static int find_exe_base(struct dl_phdr_info *info, size_t size, void *data) {
+    (void)size;
+    if (info->dlpi_name[0] == '\0') {
+        *(uintptr_t *)data = info->dlpi_addr;
+        return 1; /* stop iterating */
+    }
+    return 0;
+}
+
+/* Bun 1.3.12+ compiled binaries: buno is a separate ELF loaded by ld.so,
+ * so its BUN_COMPILED.size is 0. The wrapper's vaddr belongs to the wrapper's
+ * mappings, not buno's. We mmap the .bun section from the wrapper and patch
+ * buno's BUN_COMPILED.size to point to the mapped section.
+ * Format: [u64 len][payload bytes] (ELF.getData in StandaloneModuleGraph).
+ */
+static void patch_bun_compiled(void) {
+    const char *s = getenv("BUN_TERMUX_COMPILED");
+    if (!s) return;
+    unsetenv("BUN_TERMUX_COMPILED");
+
+    char *end;
+    unsigned long long target = strtoull(s, &end, 16);
+    unsigned long long off = (*end == ',') ? strtoull(end + 1, &end, 16) : 0;
+    unsigned long long len = (*end == ',') ? strtoull(end + 1, &end, 16) : 0;
+    if (*end != '\0' || target == 0 || len == 0) return;
+
+    int fd = real_openat(AT_FDCWD, "/proc/self/exe", O_RDONLY, 0);
+    if (fd < 0) return;
+
+    long ps = sysconf(_SC_PAGESIZE);
+    /* Bun's elf.zig page-aligns the .bun section offset, so
+     * 'off' is always page-aligned and the mmap offset is exact.
+     */
+    size_t map_len = ((size_t)len + ps - 1) & ~(size_t)(ps - 1);
+    void *mapped = mmap(NULL, map_len, PROT_READ, MAP_PRIVATE, fd, (off_t)off);
+    if (mapped != MAP_FAILED) {
+        /* BUN_COMPILED is a mutable global in buno's data segment,
+         * so the target page is already writable.
+         * buno is currently ET_EXEC (base == 0), but add the load base
+         * anyway so this keeps working if Bun ever switches to PIE. */
+        uintptr_t base = 0;
+        dl_iterate_phdr(find_exe_base, &base);
+        *(volatile uint64_t *)(base + target) = (uint64_t)mapped;
+    }
+    close(fd);
+}
+
+static int generate_proc_stat(char *buf, size_t size) {
+    int ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu < 1) ncpu = 1;
+    if (ncpu > 256) ncpu = 256;
+    
+    int total = 0;
+    int n;
+    
+    n = snprintf(buf + total, size - total, "cpu  0 0 0 0 0 0 0 0 0 0\n");
+    if (n < 0) return n;
+    total += n;
+    
+    for (int i = 0; i < ncpu && total < (int)size - 128; i++) {
+        n = snprintf(buf + total, size - total, "cpu%d 0 0 0 0 0 0 0 0 0 0\n", i);
+        if (n < 0) return n;
+        total += n;
+    }
+    
+    n = snprintf(buf + total, size - total, "intr 0\nctxt 0\nbtime %ld\nprocesses 1\nprocs_running 1\nprocs_blocked 0\n", time(NULL));
+    if (n < 0) return n;
+    total += n;
+    
+    return total;
+}
+
+static int do_openat(int (*real_fn)(int, const char *, int, ...),
+                     int dirfd, const char *pathname, int flags, va_list ap) {
+    if (pathname && strcmp(pathname, "/proc/stat") == 0) {
+        int fd = memfd_create("proc_stat", MFD_CLOEXEC);
+        if (fd >= 0) {
+            /* Sized for the ncpu cap: header + 256 cpu lines (~27 B each) + footer. */
+            char buf[8192];
+            int n = generate_proc_stat(buf, sizeof(buf));
+            if (n > 0) {
+                ssize_t written = write(fd, buf, n);
+                if (written == n && lseek(fd, 0, SEEK_SET) == 0) {
+                    return fd;
+                }
+            }
+            close(fd);
+        }
+    }
+
+    mode_t mode = 0;
+    if (__OPEN_NEEDS_MODE(flags))
+        mode = va_arg(ap, mode_t);
+    int fd = real_fn(dirfd, pathname, flags, mode);
+
+    if (fd < 0 && errno == EACCES && (flags & O_DIRECTORY) && safe_dir_fd >= 0 && is_ancestor(pathname)) {
+        int saved_errno = errno;
+        int cmd = (flags & O_CLOEXEC) ? F_DUPFD_CLOEXEC : F_DUPFD;
+        int dup_fd = fcntl(safe_dir_fd, cmd, 0);
+        if (dup_fd >= 0)
+            fd = dup_fd;
+        else
+            errno = saved_errno;
+    }
+
+    return fd;
+}
+
+int openat(int dirfd, const char *pathname, int flags, ...) {
+    va_list ap;
+    va_start(ap, flags);
+    int result = do_openat(real_openat, dirfd, pathname, flags, ap);
+    va_end(ap);
+    return result;
+}
+
+int openat64(int dirfd, const char *pathname, int flags, ...) {
+    va_list ap;
+    va_start(ap, flags);
+    int result = do_openat(real_openat64, dirfd, pathname, flags, ap);
+    va_end(ap);
+    return result;
+}
+
+/* c-ares reads DNS configs via fopen, not openat */
+FILE *fopen(const char *pathname, const char *mode) {
+    char buf[PATH_MAX];
+    if (pathname)
+        pathname = translate_etc(pathname, buf, sizeof(buf));
+    return real_fopen(pathname, mode);
+}
+
+FILE *fopen64(const char *pathname, const char *mode) {
+    char buf[PATH_MAX];
+    if (pathname)
+        pathname = translate_etc(pathname, buf, sizeof(buf));
+    return real_fopen64(pathname, mode);
+}
+
+/* Replace first occurrence of 'search' with 'replace' in 'path_var'.
+ * Used specifically for PATH variable rewriting.
+ * Caller must free the returned string.
+ */
+static char *replace_in_path(const char *path_var, const char *search, const char *replace) {
+    const char *found = strstr(path_var, search);
+    if (!found) return NULL;
+    
+    size_t prefix_len = found - path_var;
+    size_t search_len = strlen(search);
+    size_t replace_len = strlen(replace);
+    size_t suffix_len = strlen(found + search_len);
+    
+    char *result = malloc(prefix_len + replace_len + suffix_len + 1);
+    if (!result) return NULL;
+    
+    memcpy(result, path_var, prefix_len);
+    memcpy(result + prefix_len, replace, replace_len);
+    memcpy(result + prefix_len + replace_len, found + search_len, suffix_len + 1);
+    
+    return result;
+}
+
+/*
+ * Parse shebang and return translated interpreter path.
+ * Returns: 0 on success (shebang found and parsed), -1 if not a shebang.
+ */
+static int parse_shebang(const char *path, char *interp, size_t interp_size,
+                         char *interp_arg, size_t arg_size) {
+    int fd = real_openat(AT_FDCWD, path, O_RDONLY | O_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    
+    char buf[SHEBANG_MAX];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    
+    if (n < 2 || buf[0] != '#' || buf[1] != '!') return -1;
+    
+    char *start = buf + 2;
+    while (start < buf + n && (*start == ' ' || *start == '\t')) start++;
+    if (start >= buf + n) return -1;
+    
+    char *end = start;
+    while (end < buf + n && *end != ' ' && *end != '\t' && *end != '\n' && *end != '\r') end++;
+    
+    size_t interp_len = end - start;
+    if (interp_len == 0 || interp_len >= interp_size) return -1;
+    
+    memcpy(interp, start, interp_len);
+    interp[interp_len] = '\0';
+    
+    interp_arg[0] = '\0';
+    char *arg_start = end;
+    while (arg_start < buf + n && (*arg_start == ' ' || *arg_start == '\t')) arg_start++;
+    
+    if (arg_start < buf + n && *arg_start != '\n' && *arg_start != '\r') {
+        char *arg_end = arg_start;
+        while (arg_end < buf + n && *arg_end != ' ' && *arg_end != '\t' && 
+               *arg_end != '\n' && *arg_end != '\r') arg_end++;
+        size_t arg_len = arg_end - arg_start;
+        if (arg_len > 0 && arg_len < arg_size) {
+            memcpy(interp_arg, arg_start, arg_len);
+            interp_arg[arg_len] = '\0';
+        }
+    }
+    
+    return 0;
+}
+
+int execve(const char *pathname, char *const argv[], char *const envp[]) {
+    char interp_buf[256], arg_buf[256], translated_buf[256];
+    char **new_envp = NULL, **new_argv = NULL;
+    char *new_path = NULL;
+    int ret = -1;
+    
+    /* Rewrite PATH if it contains /tmp/bun-node */
+    for (int i = 0; envp && envp[i]; i++) {
+        if (strncmp(envp[i], "PATH=", 5) == 0) {
+            char replacement[PATH_MAX];
+            int n = snprintf(replacement, sizeof(replacement), "%s/bun-node", TMPDIR);
+            if (n < 0 || (size_t)n >= sizeof(replacement))
+                break; /* TMPDIR too long - skip PATH rewrite */
+            
+            new_path = replace_in_path(envp[i], "/tmp/bun-node", replacement);
+            if (new_path) {
+                int env_count = 0;
+                while (envp[env_count]) env_count++;
+                
+                new_envp = malloc((env_count + 1) * sizeof(char *));
+                if (new_envp) {
+                    for (int j = 0; j < env_count; j++)
+                        new_envp[j] = (j == i) ? new_path : (char *)envp[j];
+                    new_envp[env_count] = NULL;
+                    envp = (char *const *)new_envp;
+                }
+            }
+            break;
+        }
+    }
+    
+    if (parse_shebang(pathname, interp_buf, sizeof(interp_buf),
+                      arg_buf, sizeof(arg_buf)) == 0) {
+        const char *translated = translate_path(interp_buf, translated_buf, sizeof(translated_buf));
+        
+        int orig_argc = 0;
+        while (argv[orig_argc]) orig_argc++;
+        
+        int has_arg = arg_buf[0] ? 1 : 0;
+        int new_argc = 1 + has_arg + 1 + orig_argc;
+        new_argv = malloc((new_argc + 1) * sizeof(char *));
+        if (!new_argv) {
+            errno = ENOMEM;
+            goto cleanup;
+        }
+        
+        int i = 0;
+        new_argv[i++] = (char *)translated;
+        if (has_arg) new_argv[i++] = arg_buf;
+        new_argv[i++] = (char *)(argv[0] ? argv[0] : pathname);
+        for (int j = 1; j < orig_argc; j++) new_argv[i++] = argv[j];
+        new_argv[i] = NULL;
+        
+        ret = real_execve(translated, new_argv, envp);
+    } else {
+        ret = real_execve(pathname, argv, envp);
+    }
+    
+cleanup:
+    free(new_argv);
+    free(new_path);
+    free(new_envp);
+    return ret;
+}
+
+/*
+ * Intercept linkat() and return EXDEV (error.NotSameFileSystem) to force bun to fallback to copyfile.
+ * 
+ * See: bun-bun-v1.3.10/src/install/PackageInstall.zig
+ */
+int linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, int flags) {
+    (void)olddirfd;
+    (void)oldpath;
+    (void)newdirfd;
+    (void)newpath;
+    (void)flags;
+
+    errno = EXDEV;
+    return -1;
+}
+
+int mkdir(const char *pathname, mode_t mode) {
+    char buf[PATH_MAX];
+    pathname = translate_tmp(pathname, buf, sizeof(buf));
+    return real_mkdir(pathname, mode);
+}
+
+int symlink(const char *target, const char *linkpath) {
+    char tbuf[PATH_MAX], lbuf[PATH_MAX];
+    
+    target = translate_tmp(target, tbuf, sizeof(tbuf));
+    linkpath = translate_tmp(linkpath, lbuf, sizeof(lbuf));
+    
+    if (TARGET_PATH && WRAPPER_PATH && strcmp(target, TARGET_PATH) == 0) {
+        target = WRAPPER_PATH;
+    }
+    
+    return real_symlink(target, linkpath);
+}

@@ -1,0 +1,613 @@
+/*
+ * Bun Wrapper for Termux - with userland exec
+ * 
+ * Uses userland exec to load ld.so and run bun with the shim preloaded.
+ */
+
+#define _GNU_SOURCE
+
+/* Architecture detection */
+#if defined(__aarch64__)
+    #define ARCH_AARCH64 1
+    #define ARCH_NAME "aarch64"
+    #define LD_SO_NAME "ld-linux-aarch64.so.1"
+#elif defined(__x86_64__) || defined(__amd64__)
+    #define ARCH_X86_64 1
+    #define ARCH_NAME "x86_64"
+    #define LD_SO_NAME "ld-linux-x86-64.so.2"
+#else
+    #error "Unsupported architecture"
+#endif
+
+#include <elf.h>
+
+#include <sys/syscall.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <sys/auxv.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <limits.h>
+#include <errno.h>
+
+#define LD_SO     "/data/data/com.termux/files/usr/glibc/lib/" LD_SO_NAME
+#define GLIBC_LIB "/data/data/com.termux/files/usr/glibc/lib"
+#define MAX_ENV_INJECTIONS 8  /* Current: 6, headroom: 2 */
+#define STACK_GUARD 256
+
+/* Bun 1.3.12+ requires a .bun section for --compile */
+typedef struct { uint64_t size; } BunCompiledHeader;
+#define BUN_COMPILED_ALIGNMENT (16 * 1024)
+__attribute__((section(".bun"), aligned(BUN_COMPILED_ALIGNMENT), used))
+static BunCompiledHeader BUN_COMPILED = { 0 };
+
+static void die(const char *msg) {
+    fprintf(stderr, "bun-termux: %s: %s\n", msg, strerror(errno));
+    _exit(1);
+}
+
+static inline const char *getenv_nonempty(const char *name) {
+    const char *val = getenv(name);
+    return (val && *val) ? val : NULL;
+}
+
+static inline void path_build(char *buf, size_t bufsize, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, bufsize, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= bufsize) die("path too long");
+}
+
+static char *get_self_dir(char *buf, size_t bufsize) {
+    ssize_t n = readlink("/proc/self/exe", buf, bufsize - 1);
+    if (n < 0) return NULL;
+    buf[n] = '\0';
+    char *last_slash = strrchr(buf, '/');
+    if (last_slash) *last_slash = '\0';
+    return buf;
+}
+
+static const char *resolve_glibc_path(char *buf, size_t bufsize,
+                                      const char *env_var, const char *prefix,
+                                      const char *prefix_suffix,
+                                      const char *default_path) {
+    if (env_var) return env_var;
+    if (prefix) {
+        int n = snprintf(buf, bufsize, "%s%s", prefix, prefix_suffix);
+        if (n < 0 || (size_t)n >= bufsize) die("path too long");
+        return buf;
+    }
+    return default_path;
+}
+
+#define MAX_ENV_VAL (128 * 1024)  /* Safe upper limit for env var values */
+
+static char orig_preload[MAX_ENV_VAL];
+static char orig_libpath[MAX_ENV_VAL];
+static int has_orig_preload = 0;
+static int has_orig_libpath = 0;
+
+static size_t filter_envp(char **src, const char **dst, size_t max) {
+    size_t n = 0;
+    for (char **e = src; *e && n < max; e++) {
+        /* These are internal markers the wrapper injects below. Drop any a
+         * user may have set so they can't shadow the injected value. */
+        if (strncmp(*e, "BUN_TERMUX_ORIG_LD_PRELOAD=", sizeof("BUN_TERMUX_ORIG_LD_PRELOAD=") - 1) == 0)
+            continue;
+        if (strncmp(*e, "BUN_TERMUX_ORIG_LD_LIBRARY_PATH=", sizeof("BUN_TERMUX_ORIG_LD_LIBRARY_PATH=") - 1) == 0)
+            continue;
+        if (strncmp(*e, "BUN_TERMUX_COMPILED=", sizeof("BUN_TERMUX_COMPILED=") - 1) == 0)
+            continue;
+
+        if (strncmp(*e, "LD_PRELOAD=", 11) == 0) {
+            int len = snprintf(orig_preload, sizeof(orig_preload),
+                               "BUN_TERMUX_ORIG_LD_PRELOAD=%s", *e + 11);
+            has_orig_preload = (len > 0 && (size_t)len < sizeof(orig_preload));
+            if (len > 0 && !has_orig_preload)
+                fprintf(stderr, "bun-termux: warning: LD_PRELOAD too long, discarded\n");
+            continue;
+        }
+        if (strncmp(*e, "LD_LIBRARY_PATH=", 16) == 0) {
+            int len = snprintf(orig_libpath, sizeof(orig_libpath),
+                               "BUN_TERMUX_ORIG_LD_LIBRARY_PATH=%s", *e + 16);
+            has_orig_libpath = (len > 0 && (size_t)len < sizeof(orig_libpath));
+            if (len > 0 && !has_orig_libpath)
+                fprintf(stderr, "bun-termux: warning: LD_LIBRARY_PATH too long, discarded\n");
+            continue;
+        }
+        dst[n++] = *e;
+    }
+    return n;
+}
+
+static void ensure_dir(const char *path) {
+    char tmp[PATH_MAX];
+    size_t len = strlen(path);
+    if (len >= sizeof(tmp)) die("path too long");
+    /* strlen + memcpy is ~2.5x faster than strlcpy for typical paths */
+    memcpy(tmp, path, len + 1);
+    
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            mkdir(tmp, 0755);
+            *p = '/';
+        }
+    }
+    if (mkdir(tmp, 0755) < 0 && errno != EEXIST) die("mkdir fake_root");
+}
+
+typedef struct {
+    size_t base_addr;
+    size_t entry;
+    size_t phdr_addr;
+    uint16_t phnum;
+    uint16_t phent;
+    size_t pagesz;
+} elf_info_t;
+
+static size_t page_round_down(size_t v, size_t ps) {
+    return v & ~(ps - 1);
+}
+
+static size_t page_round_up(size_t v, size_t ps) {
+    return (v + ps - 1) & ~(ps - 1);
+}
+
+static void load_elf_segments(int fd, const Elf64_Ehdr *eh, uint8_t *base, 
+                              size_t vmin, size_t ps) {
+    for (int i = 0; i < eh->e_phnum; i++) {
+        const Elf64_Phdr *ph = (const Elf64_Phdr *)(
+            (uint8_t *)eh + eh->e_phoff + i * eh->e_phentsize);
+        if (ph->p_type != PT_LOAD) continue;
+
+        size_t off_a = page_round_down(ph->p_offset, ps);
+        size_t va_a = page_round_down(ph->p_vaddr, ps);
+        size_t diff = ph->p_offset - off_a;
+        size_t mapsz = page_round_up(ph->p_filesz + diff, ps);
+
+        int prot = 0;
+        if (ph->p_flags & PF_R) prot |= PROT_READ;
+        if (ph->p_flags & PF_W) prot |= PROT_WRITE;
+        if (ph->p_flags & PF_X) prot |= PROT_EXEC;
+
+        void *seg = mmap(base + va_a - vmin, mapsz, prot | PROT_WRITE,
+                        MAP_PRIVATE | MAP_FIXED, fd, off_a);
+        if (seg == MAP_FAILED) die("segment map failed");
+
+        if (ph->p_memsz > ph->p_filesz) {
+            uint8_t *bss = base + (ph->p_vaddr - vmin) + ph->p_filesz;
+            size_t bsz = ph->p_memsz - ph->p_filesz;
+            size_t in_page = page_round_up((size_t)bss, ps) - (size_t)bss;
+            if (in_page > bsz) in_page = bsz;
+            memset(bss, 0, in_page);
+            if (bsz > in_page) {
+                /* MAP_ANON pages are pre-zeroed. Map at final prot so the
+                 * anon BSS tail is never writable for !(PF_W) segments. */
+                void *a = mmap(bss + in_page, page_round_up(bsz - in_page, ps),
+                              prot, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+                if (a == MAP_FAILED) die("BSS map failed");
+            }
+        }
+
+        if (!(ph->p_flags & PF_W))
+            mprotect(seg, mapsz, prot);
+    }
+}
+
+static size_t find_phdr_addr(const Elf64_Ehdr *eh, size_t base_addr) {
+    for (int i = 0; i < eh->e_phnum; i++) {
+        const Elf64_Phdr *ph = (const Elf64_Phdr *)(
+            (uint8_t *)eh + eh->e_phoff + i * eh->e_phentsize);
+        if (ph->p_type == PT_PHDR) 
+            return base_addr + ph->p_vaddr;
+    }
+    /* Fallback: calculate from first PT_LOAD */
+    for (int i = 0; i < eh->e_phnum; i++) {
+        const Elf64_Phdr *ph = (const Elf64_Phdr *)(
+            (uint8_t *)eh + eh->e_phoff + i * eh->e_phentsize);
+        if (ph->p_type == PT_LOAD) {
+            return base_addr + ph->p_vaddr + eh->e_phoff;
+        }
+    }
+    return 0;
+}
+
+static elf_info_t load_elf(int fd, size_t ps) {
+    struct stat st;
+    if (fstat(fd, &st) < 0) die("fstat ld.so failed");
+
+    uint8_t *fdata = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (fdata == MAP_FAILED) die("mmap ld.so failed");
+
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)fdata;
+    if (memcmp(eh->e_ident, ELFMAG, SELFMAG)) die("ld.so not ELF");
+
+    size_t vmin = (size_t)-1, vmax = 0;
+    for (int i = 0; i < eh->e_phnum; i++) {
+        const Elf64_Phdr *ph = (const Elf64_Phdr *)(
+            fdata + eh->e_phoff + i * eh->e_phentsize);
+        if (ph->p_type == PT_LOAD) {
+            if (ph->p_vaddr < vmin) vmin = ph->p_vaddr;
+            size_t e = ph->p_vaddr + ph->p_memsz;
+            if (e > vmax) vmax = e;
+        }
+    }
+    vmin = page_round_down(vmin, ps);
+    vmax = page_round_up(vmax, ps);
+
+    uint8_t *base = mmap(NULL, vmax - vmin, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (base == MAP_FAILED) die("reserve failed");
+
+    load_elf_segments(fd, eh, base, vmin, ps);
+
+    size_t base_addr = (size_t)base - vmin;
+    elf_info_t info = {
+        .base_addr = base_addr,
+        .entry = base_addr + eh->e_entry,
+        .phdr_addr = find_phdr_addr(eh, base_addr),
+        .phnum = eh->e_phnum,
+        .phent = eh->e_phentsize,
+        .pagesz = ps
+    };
+
+    munmap(fdata, st.st_size);
+    close(fd);
+    return info;
+}
+
+typedef struct {
+    uint64_t sh_addr;
+    uint64_t sh_offset;
+    uint64_t sh_size;
+} bun_section_t;
+
+/* Find the .bun section in an ELF file. Returns 0 on success, -1 on failure. */
+static int find_bun_section(const char *path, bun_section_t *out) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+
+    struct stat st;
+    uint8_t *data = NULL;
+    int ret = -1;
+
+    if (fstat(fd, &st) < 0) goto out;
+    data = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (data == MAP_FAILED) { data = NULL; goto out; }
+
+    if ((size_t)st.st_size < sizeof(Elf64_Ehdr) ||
+        memcmp(data, ELFMAG, SELFMAG) != 0 ||
+        data[EI_CLASS] != ELFCLASS64)
+        goto out;
+
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)data;
+    uint16_t shnum = eh->e_shnum;
+    uint64_t shoff = eh->e_shoff;
+    uint16_t shstrndx = eh->e_shstrndx;
+    uint16_t shentsize = eh->e_shentsize;
+
+    uint64_t file_size = (uint64_t)st.st_size;
+    if (shnum == 0 || shstrndx >= shnum) goto out;
+    if (shoff > file_size || (uint64_t)shnum * shentsize > file_size - shoff) goto out;
+
+    const Elf64_Shdr *shstr_shdr = (const Elf64_Shdr *)(data + shoff + (uint64_t)shstrndx * shentsize);
+    uint64_t strtab_off = shstr_shdr->sh_offset;
+    uint64_t strtab_size = shstr_shdr->sh_size;
+    if (strtab_off > file_size || strtab_size > file_size - strtab_off) goto out;
+
+    const char *strtab = (const char *)(data + strtab_off);
+    for (uint16_t i = 0; i < shnum; i++) {
+        const Elf64_Shdr *sh = (const Elf64_Shdr *)(data + shoff + (uint64_t)i * shentsize);
+        if (sh->sh_name >= strtab_size) continue;
+        if ((uint64_t)sh->sh_name + 5 <= strtab_size &&
+            memcmp(strtab + sh->sh_name, ".bun\0", 5) == 0) {
+            if (sh->sh_offset > file_size || sh->sh_size > file_size - sh->sh_offset) goto out;
+            out->sh_addr = sh->sh_addr;
+            out->sh_offset = sh->sh_offset;
+            out->sh_size = sh->sh_size;
+            ret = 0;
+            break;
+        }
+    }
+
+out:
+    if (data) munmap(data, st.st_size);
+    close(fd);
+    return ret;
+}
+
+/* Find the .bun section offset and total size in the wrapper's own ELF.
+ * Bun's writeBunSection sets sh_size = header_size + payload, so sh_size
+ * is the total bytes the shim needs to mmap.
+ * Returns 0 on success, -1 on failure.
+ */
+static int find_bun_payload_info(const char *path, uint64_t *file_offset, uint64_t *total_size) {
+    bun_section_t s;
+    if (find_bun_section(path, &s) < 0) return -1;
+    if (s.sh_size < sizeof(BunCompiledHeader)) return -1;
+    *file_offset = s.sh_offset;
+    *total_size = s.sh_size;
+    return 0;
+}
+
+__attribute__((noreturn))
+static void userland_exec(const char *ldso, const char **argv, size_t argc,
+                          const char **envp, size_t envc) {
+    int fd = open(ldso, O_RDONLY);
+    if (fd < 0) die("open ld.so failed");
+
+    size_t ps = sysconf(_SC_PAGESIZE);
+    elf_info_t elf = load_elf(fd, ps);
+
+    size_t stack_base;
+    uint8_t *stk = mmap(NULL, 10 * 1024 * 1024, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANON | MAP_STACK, -1, 0);
+    if (stk == MAP_FAILED) die("stack alloc failed");
+    stack_base = (size_t)stk;
+    uint8_t *sp = stk + 10 * 1024 * 1024;
+
+    #define PUSH_STR(s) ({ \
+        size_t _l = strlen(s) + 1; \
+        if ((size_t)sp - _l < stack_base + STACK_GUARD) die("stack overflow"); \
+        sp -= _l; memcpy(sp, s, _l); (size_t)sp; })
+    size_t plat_addr = PUSH_STR(ARCH_NAME);
+
+    /* AT_BASE_PLATFORM - "real" hardware name, same as platform for most */
+    size_t base_plat_addr = PUSH_STR(ARCH_NAME);
+
+    uint8_t rnd[16];
+    ssize_t got = 0;
+    while (got < 16) {
+        ssize_t n = syscall(SYS_getrandom, rnd + got, 16 - got, 0);
+        if (n < 0 && errno != EINTR) die("getrandom failed");
+        if (n > 0) got += n;
+    }
+    sp -= 16; memcpy(sp, rnd, 16);
+    size_t rnd_addr = (size_t)sp;
+
+    size_t argv_a[argc];
+    for (size_t i = 0; i < argc; i++)
+        argv_a[i] = PUSH_STR(argv[i]);
+    size_t execfn = argc ? argv_a[0] : 0;
+
+    size_t envp_a[envc];
+    for (size_t i = 0; i < envc; i++)
+        envp_a[i] = PUSH_STR(envp[i]);
+
+    size_t auxv[][2] = {
+        { AT_PHDR, elf.phdr_addr },
+        { AT_PHENT, elf.phent },
+        { AT_PHNUM, elf.phnum },
+        { AT_PAGESZ, elf.pagesz },
+        { AT_BASE, elf.base_addr },
+        { AT_FLAGS, 0 },
+        { AT_ENTRY, elf.entry },
+        { AT_UID, getuid() },
+        { AT_EUID, geteuid() },
+        { AT_GID, getgid() },
+        { AT_EGID, getegid() },
+        { AT_HWCAP, getauxval(AT_HWCAP) },
+        { AT_HWCAP2, getauxval(AT_HWCAP2) },
+        { AT_CLKTCK, sysconf(_SC_CLK_TCK) },
+        { AT_RANDOM, rnd_addr },
+        { AT_SECURE, getauxval(AT_SECURE) },
+        { AT_SYSINFO_EHDR, getauxval(AT_SYSINFO_EHDR) },
+        { AT_EXECFN, execfn },
+        { AT_PLATFORM, plat_addr },
+        { AT_BASE_PLATFORM, base_plat_addr },
+#ifdef AT_MINSIGSTKSZ
+        { AT_MINSIGSTKSZ, getauxval(AT_MINSIGSTKSZ) },
+#endif
+#ifdef AT_RSEQ_FEATURE_SIZE
+        { AT_RSEQ_FEATURE_SIZE, getauxval(AT_RSEQ_FEATURE_SIZE) },
+        { AT_RSEQ_ALIGN, getauxval(AT_RSEQ_ALIGN) },
+#endif
+#ifdef AT_HWCAP3
+        { AT_HWCAP3, getauxval(AT_HWCAP3) },
+#endif
+#ifdef AT_HWCAP4
+        { AT_HWCAP4, getauxval(AT_HWCAP4) },
+#endif
+        { AT_NULL, 0 },
+    };
+    size_t auxc = sizeof(auxv) / sizeof(auxv[0]);
+
+    size_t nwords = 1 + (argc + 1) + (envc + 1) + auxc * 2;
+    size_t data_sz = nwords * 8;
+    sp = (uint8_t *)(((size_t)sp - data_sz) & ~(size_t)15);
+
+    size_t *w = (size_t *)sp;
+    *w++ = argc;
+    for (size_t i = 0; i < argc; i++) *w++ = argv_a[i];
+    *w++ = 0;
+    for (size_t i = 0; i < envc; i++) *w++ = envp_a[i];
+    *w++ = 0;
+    for (size_t i = 0; i < auxc; i++) { *w++ = auxv[i][0]; *w++ = auxv[i][1]; }
+
+/* Jump to ld.so entry point.
+ *
+ * We don't zero registers (unlike the kernel's ELF_PLAT_INIT) because
+ * ld.so immediately overwrites them anyway:
+ *   - AArch64: sets x0=sp, then x0=&_dl_fini before jumping to user
+ *   - x86_64: moves rsp->rdi, sets rdx=&_dl_fini before jumping
+ *
+ * Sources:
+ *   glibc: sysdeps/aarch64/dl-start.S, sysdeps/x86_64/dl-machine.h
+ *   kernel: arch/arm64/include/asm/elf.h, arch/x86/include/asm/elf.h
+ */
+#if ARCH_AARCH64
+    __asm__ volatile(
+        "mov sp, %[sp]\n"
+        "br  %[entry]\n"
+        :
+        : [sp] "r"((size_t)sp), [entry] "r"(elf.entry)
+        : "memory"
+    );
+#elif ARCH_X86_64
+    __asm__ volatile(
+        "mov %[sp], %%rsp\n\t"
+        "jmp *%[entry]"
+        :
+        : [sp] "r"((size_t)sp), [entry] "r"(elf.entry)
+        : "memory"
+    );
+#endif
+    __builtin_unreachable();
+}
+
+int main(int argc, char **argv, char **envp) {
+    
+    const char *bun_install = getenv_nonempty("BUN_INSTALL");
+    const char *bun_binary = getenv_nonempty("BUN_BINARY_PATH");
+    const char *prefix = getenv_nonempty("PREFIX");
+    static char ld_path[PATH_MAX], lib_path[PATH_MAX];
+    
+    const char *ld_so = resolve_glibc_path(ld_path, sizeof(ld_path),
+                                           getenv_nonempty("GLIBC_LD_SO"), prefix,
+                                           "/glibc/lib/" LD_SO_NAME, LD_SO);
+    
+    const char *glibc_lib = resolve_glibc_path(lib_path, sizeof(lib_path),
+                                               getenv_nonempty("GLIBC_LIB"), prefix,
+                                               "/glibc/lib", GLIBC_LIB);
+    
+    char self_dir[PATH_MAX];
+    if (!get_self_dir(self_dir, sizeof(self_dir)))
+        die("cannot find binary directory");
+    
+    char shim_path[PATH_MAX];
+    char fake_root[PATH_MAX];
+    char bun_path[PATH_MAX];
+    struct stat st;
+
+    if (bun_install) {
+        path_build(shim_path, sizeof(shim_path), "%s/lib/bun-shim.so", bun_install);
+        if (stat(shim_path, &st) == 0) {
+            path_build(fake_root, sizeof(fake_root), "%s/tmp/fake-root", bun_install);
+            goto have_shim;
+        }
+    }
+    
+    path_build(shim_path, sizeof(shim_path), "%s/bun-shim.so", self_dir);
+    if (stat(shim_path, &st) == 0) {
+        path_build(fake_root, sizeof(fake_root), "%s/tmp/fake-root", self_dir);
+        goto have_shim;
+    }
+    
+    path_build(shim_path, sizeof(shim_path), "%s/../lib/bun-shim.so", self_dir);
+    if (stat(shim_path, &st) != 0)
+        die("shim not found. Run 'make install' first.");
+    path_build(fake_root, sizeof(fake_root), "%s/../tmp/fake-root", self_dir);
+
+have_shim:
+    if (bun_binary) {
+        path_build(bun_path, sizeof(bun_path), "%s", bun_binary);
+    } else if (bun_install) {
+        path_build(bun_path, sizeof(bun_path), "%s/bin/buno", bun_install);
+    } else {
+        path_build(bun_path, sizeof(bun_path), "%s/buno", self_dir);
+    }
+    
+    ensure_dir(fake_root);
+    
+    const char *prefix_args[] = {
+        ld_so, "--preload", shim_path, "--library-path", glibc_lib, bun_path
+    };
+    size_t n_prefix = sizeof(prefix_args) / sizeof(prefix_args[0]);
+    
+    const char **new_argv = malloc((n_prefix + argc) * sizeof(char *));
+    if (!new_argv) die("out of memory");
+    
+    size_t na = 0;
+    for (size_t i = 0; i < n_prefix; i++) new_argv[na++] = prefix_args[i];
+    for (int i = 1; i < argc; i++) new_argv[na++] = argv[i];
+    new_argv[na] = NULL;
+    
+    size_t env_count = 0;
+    while (envp[env_count]) env_count++;
+    
+    const char **new_envp = malloc((env_count + MAX_ENV_INJECTIONS + 1) * sizeof(char *));
+    if (!new_envp) die("out of memory");
+    
+    size_t ne = filter_envp(envp, new_envp, env_count);
+    
+    const char *inject_envs[MAX_ENV_INJECTIONS];
+    size_t n_inject = 0;
+    
+    #define ADD_INJECTION(ptr) do { \
+        if (n_inject >= MAX_ENV_INJECTIONS) \
+            die("bug: too many env injections, increase MAX_ENV_INJECTIONS"); \
+        inject_envs[n_inject++] = (ptr); \
+    } while(0)
+    
+    if (has_orig_preload) ADD_INJECTION(orig_preload);
+    if (has_orig_libpath) ADD_INJECTION(orig_libpath);
+
+    static char fake_root_env[PATH_MAX + 20];
+    if (!getenv_nonempty("BUN_FAKE_ROOT")) {
+        path_build(fake_root_env, sizeof(fake_root_env), "BUN_FAKE_ROOT=%s", fake_root);
+        ADD_INJECTION(fake_root_env);
+    }
+
+    static char wrapper_env[PATH_MAX + 32];
+    static char target_env[PATH_MAX + 32];
+    char self_path[PATH_MAX];
+    ssize_t self_len = readlink("/proc/self/exe", self_path, sizeof(self_path) - 1);
+    if (self_len > 0) {
+        self_path[self_len] = '\0';
+        snprintf(wrapper_env, sizeof(wrapper_env), "BUN_TERMUX_WRAPPER=%s", self_path);
+        ADD_INJECTION(wrapper_env);
+    }
+    snprintf(target_env, sizeof(target_env), "BUN_TERMUX_TARGET=%s", bun_path);
+    ADD_INJECTION(target_env);
+
+    /* Bun 1.3.12+ (commit 66f7c41412) switched Linux --compile to an ELF
+     * section approach: writeBunSection exposes the module graph via a
+     * PT_LOAD and stores the payload vaddr in BUN_COMPILED.size. At runtime,
+     * StandaloneModuleGraph dereferences that vaddr directly.
+     *
+     * The wrapper runs as "bun", so --compile targets it, not buno.
+     * Buno's BUN_COMPILED.size stays 0, the wrapper's vaddr is only
+     * valid in the wrapper's address space.
+     *
+     * So we broker access: parse buno's ELF for its BUN_COMPILED runtime
+     * address, parse the wrapper's ELF for the .bun section file offset
+     * and total size, and let the shim mmap the .bun section from
+     * /proc/self/exe and patch buno's BUN_COMPILED.size.
+     *
+     * Sources (paths moved in 1.3.14):
+     *   src/elf.zig -> src/exe_format/elf.zig (writeBunSection)
+     *   src/StandaloneModuleGraph.zig -> src/standalone_graph/StandaloneModuleGraph.zig (ELF.getData)
+     *   src/bun.js/bindings/c-bindings.cpp -> src/jsc/bindings/c-bindings.cpp (BUN_COMPILED symbol)
+     */
+    static char compile_env[128];
+    if (BUN_COMPILED.size != 0) {
+        if (self_len <= 0) die("cannot read /proc/self/exe for compiled binary");
+        /* sh_addr == &BUN_COMPILED (the only symbol in .bun) */
+        bun_section_t bun_sec;
+        uint64_t target_vaddr = find_bun_section(bun_path, &bun_sec) == 0 ? bun_sec.sh_addr : 0;
+        uint64_t payload_offset, total_size;
+        if (target_vaddr != 0 &&
+            find_bun_payload_info(self_path, &payload_offset, &total_size) == 0) {
+            snprintf(compile_env, sizeof(compile_env),
+                     "BUN_TERMUX_COMPILED=%llx,%llx,%llx",
+                     (unsigned long long)target_vaddr,
+                     (unsigned long long)payload_offset,
+                     (unsigned long long)total_size);
+            ADD_INJECTION(compile_env);
+        }
+    }
+
+    #undef ADD_INJECTION
+    
+    for (size_t i = 0; i < n_inject; i++) new_envp[ne++] = inject_envs[i];
+    new_envp[ne] = NULL;
+
+    userland_exec(ld_so, new_argv, na, new_envp, ne);
+}
