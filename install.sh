@@ -187,9 +187,20 @@ if [ ! -f "$CLINE_LIB/cline" ]; then
             exit 1
         }
     done
-    if ! curl -fSL --retry 3 -o "$TGZ" "$CLINE_TGZ_URL"; then
-        echo "ERROR: download failed: $CLINE_TGZ_URL" >&2
-        rm -rf "$DL_DIR"
+    echo "==> Downloading Cline ${CLINE_VERSION} from npm (~52 MB)..."
+    dl_ok=0
+    for attempt in 1 2 3 4 5; do
+        if curl -fSL --retry 5 --retry-all-errors --retry-delay 3 -C - \
+             -o "$TGZ" "$CLINE_TGZ_URL"; then
+            dl_ok=1
+            break
+        fi
+        echo "==> Download attempt $attempt failed; retrying (resume)..."
+        sleep 3
+    done
+    if [ "$dl_ok" != "1" ]; then
+        echo "ERROR: download failed after retries: $CLINE_TGZ_URL" >&2
+        echo "       Check your internet connection and re-run: bash install.sh" >&2
         exit 1
     fi
     got=$(sha256sum "$TGZ" | awk '{print $1}')
