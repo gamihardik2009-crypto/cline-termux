@@ -99,6 +99,24 @@ if [ ! -x "$GLIBC_LD" ]; then
         exit 1
     }
 fi
+
+# Repair path: apt/dpkg may consider glibc "installed" while its files are
+# actually missing (interrupted install, manual cleanup, partial removal).
+# Force a reinstall until the loader really exists on disk.
+if [ ! -x "$GLIBC_LD" ]; then
+    echo "==> glibc files missing although packages are registered; repairing..."
+    DEBIAN_FRONTEND=noninteractive pkg reinstall -y glibc glibc-runner 2>/dev/null || true
+fi
+if [ ! -x "$GLIBC_LD" ]; then
+    echo "==> Still missing; purging and reinstalling glibc packages..."
+    dpkg --purge glibc glibc-runner glibc-repo >/dev/null 2>&1 || true
+    rm -rf "$PREFIX/glibc"
+    DEBIAN_FRONTEND=noninteractive pkg update -y >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive pkg install -y glibc-repo glibc-runner || {
+        echo "ERROR: failed to install glibc-repo / glibc-runner" >&2
+        exit 1
+    }
+fi
 if [ ! -x "$GLIBC_LD" ]; then
     echo "ERROR: glibc loader still missing: $GLIBC_LD" >&2
     echo "       Try:  pkg install -y glibc-repo glibc-runner" >&2
