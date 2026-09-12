@@ -30,7 +30,7 @@ bash install.sh
 The installer automatically:
 
 1. Verifies you are on Termux + aarch64 (fails clearly otherwise)
-2. Installs the `glibc-runner` runtime via `pkg` if not already present
+2. Configures the official Termux **glibc repository** on fresh installs — it installs the `glibc-repo` package via `pkg`, or (when the main mirror is unconfigured) writes `$PREFIX/etc/apt/sources.list.d/glibc.list` directly with the official repo line — then installs the glibc runtime (`glibc-runner`) if the loader is not already present. Existing configurations are never overwritten unnecessarily.
 3. Downloads the official Cline CLI binary from the npm registry (~50 MB) and verifies its SHA-256 checksum
 4. Installs everything under `$PREFIX/lib/cline` and puts `cline` on your `$PATH`
 

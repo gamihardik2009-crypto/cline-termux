@@ -4,8 +4,10 @@
 #
 # What this does:
 #   1. Detects Termux and the aarch64 architecture.
-#   2. Installs the glibc runtime dependency (glibc-repo + glibc-runner) if
-#      the glibc loader is not already present.
+#   2. Configures the official Termux glibc repository (via the 'glibc-repo'
+#      package, or by writing its sources.list.d entry directly on fresh
+#      installs) and installs the glibc runtime (glibc-runner) if the glibc
+#      loader is not already present.
 #   3. Verifies the integrity of the bundled runtime files (SHA-256).
 #   4. Installs the runtime under $PREFIX/lib/cline and the `cline` launcher
 #      under $PREFIX/bin/cline.
@@ -49,12 +51,50 @@ case "$ARCH" in
 esac
 
 # ---------------------------------------------------------------------------
-# 3. Ensure required tools exist (install them ourselves if missing)
+# 3. Package-manager helpers (also used to heal a missing main mirror)
+# ---------------------------------------------------------------------------
+APT="pkg"
+command -v pkg >/dev/null 2>&1 || APT=apt-get
+
+# Run a package-manager command quietly; dump its output only on failure.
+run_pkg() {
+    local _log
+    _log=$(mktemp "${TMPDIR:-/tmp}/cline-pkg.XXXXXX") || return 1
+    if DEBIAN_FRONTEND=noninteractive "$@" >"$_log" 2>&1; then
+        rm -f "$_log"
+        return 0
+    fi
+    echo "--- failed command: $* ---" >&2
+    sed 's/^/    /' "$_log" >&2
+    rm -f "$_log"
+    return 1
+}
+
+backup_file() { # backup_file path  (timestamped .bak copy; no-op if absent)
+    [ -e "$1" ] || return 0
+    cp -f "$1" "$1.bak.$(date +%Y%m%d-%H%M%S)"
+}
+
+# Restore the factory main mirror ONLY when sources.list is missing or has no
+# active 'deb' line (never touches a user-configured mirror).
+ensure_main_mirror() {
+    grep -qs '^[[:space:]]*deb ' "$PREFIX/etc/apt/sources.list" 2>/dev/null && return 0
+    echo "==> main Termux mirror not configured; restoring default sources.list"
+    backup_file "$PREFIX/etc/apt/sources.list"
+    mkdir -p "$PREFIX/etc/apt"
+    printf '# The main termux repository, with cloudflare cache\ndeb https://packages-cf.termux.dev/apt/termux-main/ stable main\n' \
+        > "$PREFIX/etc/apt/sources.list"
+    run_pkg "$APT" update -y || true
+}
+
+# ---------------------------------------------------------------------------
+# 3b. Ensure required tools exist (install them ourselves if missing)
 # ---------------------------------------------------------------------------
 for tool in curl tar; do
     if ! command -v "$tool" >/dev/null 2>&1; then
+        ensure_main_mirror
         echo "==> Installing missing tool: $tool"
-        DEBIAN_FRONTEND=noninteractive pkg install -y "$tool" || {
+        run_pkg "$APT" install -y "$tool" || {
             echo "ERROR: failed to install $tool" >&2
             exit 1
         }
@@ -81,23 +121,108 @@ if [ -d "$PREFIX/lib/cline" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Install runtime dependencies if required (glibc loader + libraries)
+# 4. Ensure the Termux glibc repository and runtime (glibc loader + libraries)
+# ---------------------------------------------------------------------------
+# Cline's binary needs the glibc loader shipped by Termux's glibc repository.
+# A fresh Termux has neither the repository nor its packages, and some installs
+# also lack a working main mirror ("No mirror or mirror group selected"),
+# which used to abort this installer with:
+#     E: Unable to locate package glibc-repo
+#
+# This block, in order:
+#   a. does nothing when the glibc loader already exists (idempotent);
+#   b. ensures $PREFIX/etc/apt/sources.list.d/glibc.list exists -- preferring
+#      the official 'glibc-repo' package (from the main Termux repo) and, if
+#      that is impossible, writing the exact repository line that package
+#      installs (no bundled binaries);
+#   c. restores the default main mirror ONLY when sources.list is missing or
+#      has no active deb line (never touches a user-configured mirror);
+#   d. refreshes the package index;
+#   e. installs glibc-runner (which pulls in glibc);
+#   f. on failure, names the failing layer (repository / mirror+network /
+#      package manager state).  Unrelated packages such as xdg-utils or
+#      icewm are never purged or reconfigured by this installer.
 # ---------------------------------------------------------------------------
 GLIBC_LD="$PREFIX/glibc/lib/ld-linux-aarch64.so.1"
 GLIBC_LIBC="$PREFIX/glibc/lib/libc.so.6"
 
+GLIBC_LIST_DIR="$PREFIX/etc/apt/sources.list.d"
+GLIBC_LIST="$GLIBC_LIST_DIR/glibc.list"
+# Exactly what the official 'glibc-repo' package (termux-packages) writes.
+GLIBC_LIST_CONTENT='# The glibc termux repository, with cloudflare cache
+deb https://packages-cf.termux.dev/apt/termux-glibc/ glibc stable
+# The glibc termux repository, without cloudflare cache
+# deb https://packages.termux.dev/apt/termux-glibc/ glibc stable'
+
+glibc_repo_configured() {
+    [ -f "$GLIBC_LIST" ] && grep -qs '^[[:space:]]*deb .*termux-glibc' "$GLIBC_LIST"
+}
+
+write_glibc_list() { # write the official glibc repo definition ourselves
+    mkdir -p "$GLIBC_LIST_DIR"
+    backup_file "$GLIBC_LIST"
+    printf '%s\n' "$GLIBC_LIST_CONTENT" > "$GLIBC_LIST"
+}
+
 if [ ! -x "$GLIBC_LD" ]; then
+    echo "==> glibc runtime not found; setting up the Termux glibc repository..."
+
+    # -- 4b. make sure the glibc APT repository is configured ----------------
+    if glibc_repo_configured; then
+        echo "==> glibc repository already configured: $GLIBC_LIST"
+    else
+        # Preferred path: the official bootstrap package from the main repo
+        # (it writes glibc.list and refreshes the index in its postinst).
+        if run_pkg "$APT" install -y glibc-repo; then
+            echo "==> glibc repository configured via the glibc-repo package"
+        fi
+        if ! glibc_repo_configured; then
+            # The main mirror may be missing entirely (fresh/broken Termux);
+            # restore factory defaults only when there is no active deb line.
+            ensure_main_mirror
+            run_pkg "$APT" install -y glibc-repo || true
+            if ! glibc_repo_configured; then
+                # Last resort: write the repository file directly, byte-for-byte
+                # identical to what the official glibc-repo package installs.
+                echo "==> adding the glibc repository directly ($GLIBC_LIST)"
+                write_glibc_list
+            fi
+        fi
+    fi
+
+    # -- 4d. refresh the package index ---------------------------------------
+    # Tolerate partial failures: a broken main mirror must not abort us if the
+    # glibc repository index was fetched successfully.
     echo "==> Refreshing package index..."
-    DEBIAN_FRONTEND=noninteractive pkg update -y >/dev/null 2>&1 || true
-    echo "==> Installing glibc runtime (glibc-repo, glibc-runner) ..."
-    DEBIAN_FRONTEND=noninteractive pkg install -y glibc-repo || {
-        echo "ERROR: failed to install glibc-repo (check network / Termux repos)" >&2
+    if ! run_pkg "$APT" update -y; then
+        echo "WARN: package index refresh failed for at least one repository;" >&2
+        echo "      continuing (the glibc repository may still be usable)." >&2
+    fi
+    # -- 4e. install the glibc runtime ---------------------------------------
+    if ! run_pkg "$APT" install -y glibc-runner; then
+        echo "ERROR: failed to install the glibc runtime (glibc-runner)." >&2
+        if ! glibc_repo_configured; then
+            echo "       Cause: the glibc repository is not configured." >&2
+            echo "       Expected repo file: $GLIBC_LIST" >&2
+            echo "       Re-run install.sh; if it persists, add the repo line:" >&2
+            echo "         deb https://packages-cf.termux.dev/apt/termux-glibc/ glibc stable" >&2
+        elif ! curl -fsL --max-time 20 -o /dev/null \
+                https://packages-cf.termux.dev/apt/termux-glibc/dists/glibc/InRelease; then
+            echo "       Cause: the glibc repository is unreachable (network/mirror)." >&2
+            echo "       Check your internet connection, or refresh mirrors with:" >&2
+            echo "         termux-change-repo" >&2
+        else
+            echo "       Cause: the package manager state looks broken," >&2
+            echo "       or the index refresh was skipped/failed." >&2
+            echo "       Try:  pkg update && pkg install -y glibc-runner" >&2
+            echo "       Or:   dpkg --configure -a" >&2
+            echo "       (This installer never removes unrelated packages.)" >&2
+        fi
         exit 1
-    }
-    DEBIAN_FRONTEND=noninteractive pkg install -y glibc-runner || {
-        echo "ERROR: failed to install glibc-runner" >&2
-        exit 1
-    }
+    fi
+    # Best effort: also register the repository package with dpkg when the
+    # main repo is usable (keeps future pkg upgrades managing glibc.list).
+    DEBIAN_FRONTEND=noninteractive "$APT" install -y glibc-repo >/dev/null 2>&1 || true
 fi
 
 # Repair path: apt/dpkg may consider glibc "installed" while its files are
@@ -105,15 +230,19 @@ fi
 # Force a reinstall until the loader really exists on disk.
 if [ ! -x "$GLIBC_LD" ]; then
     echo "==> glibc files missing although packages are registered; repairing..."
-    DEBIAN_FRONTEND=noninteractive pkg reinstall -y glibc glibc-runner 2>/dev/null || true
+    run_pkg "$APT" reinstall -y glibc glibc-runner || true
 fi
 if [ ! -x "$GLIBC_LD" ]; then
-    echo "==> Still missing; purging and reinstalling glibc packages..."
+    echo "==> Still missing; purging and reinstalling the glibc packages..."
+    # NOTE: only our own glibc packages are purged here.  IMPORTANT: the
+    # 'glibc-repo' package owns glibc.list, so purging it removes the repo
+    # definition -- restore the file before reinstalling anything.
     dpkg --purge glibc glibc-runner glibc-repo >/dev/null 2>&1 || true
     rm -rf "$PREFIX/glibc"
-    DEBIAN_FRONTEND=noninteractive pkg update -y >/dev/null 2>&1 || true
-    DEBIAN_FRONTEND=noninteractive pkg install -y glibc-repo glibc-runner || {
-        echo "ERROR: failed to install glibc-repo / glibc-runner" >&2
+    glibc_repo_configured || write_glibc_list
+    run_pkg "$APT" update -y || true
+    run_pkg "$APT" install -y glibc-runner || {
+        echo "ERROR: failed to install glibc-runner" >&2
         exit 1
     }
 fi
